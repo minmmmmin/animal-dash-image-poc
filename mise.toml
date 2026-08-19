@@ -11,14 +11,13 @@ _.python.venv = { path = ".venv", create = true }
 description = "Install the project (editable) into the mise-managed venv"
 run = "uv pip install -e ."
 
-[tasks.sample]
-description = "Generate a synthetic sample photo for pipeline testing"
-run = "python scripts/make_sample.py"
+# samples/ にはテスト用の画像（実写真やモックアップ）を各自置く。以下は一例として
+# samples/dragon.png を対象にしているので、手元のファイル名に合わせて書き換えて使う。
 
 [tasks.run]
 description = "Run the full pipeline (preprocess + Gemini status) on a sample image"
-run = "python -m animal_dash_image_poc.cli run samples/sample_01.jpg -o output/sample_01"
+run = "python -m animal_dash_image_poc.cli run samples/dragon.png -o output/dragon"
 
 [tasks.preprocess]
 description = "Run only the OpenCV preprocessing step on a sample image"
-run = "python -m animal_dash_image_poc.cli preprocess samples/sample_01.jpg -o output/sample_01.png --debug output/debug_sample_01"
+run = "python -m animal_dash_image_poc.cli preprocess samples/dragon.png -o output/dragon.png --debug output/debug_dragon"

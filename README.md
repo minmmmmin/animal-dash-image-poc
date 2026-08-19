@@ -35,7 +35,9 @@ mise run setup    # uv pip install -e . （.venv に依存関係をインスト�
 ### mise を使わない場合
 
 miseはPythonバージョン固定と`mise run ...`タスクの薄いラッパーなので、無くても標準の
-venv + pip だけでセットアップできる（Python 3.13以上を想定）。
+venv + pip だけでセットアップできる（Python 3.13以上を想定。[python.org](https://www.python.org/downloads/)からインストール）。
+
+**macOS / Linux**
 
 ```bash
 python3 -m venv .venv
@@ -43,13 +45,36 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-以降の `mise run sample` / `mise run preprocess` / `mise run run` は、venvを
-activateした状態で以下のコマンドに読み替えればよい（各タスクの中身は `mise.toml` を参照）。
+**Windows（PowerShell）**
+
+```powershell
+py -3.13 -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -e .
+```
+
+PowerShellでスクリプト実行がブロックされる場合は、一度だけ以下を実行してから
+Activate.ps1を叩く（実行ポリシーの変更）。
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+**Windows（コマンドプロンプト）**
+
+```bat
+py -3.13 -m venv .venv
+.venv\Scripts\activate.bat
+pip install -e .
+```
+
+以降の `mise run preprocess` / `mise run run` は、venvをactivateした状態で
+以下のコマンドに読み替えればよい（各タスクの中身は `mise.toml` を参照）。
+このコマンド自体はOS共通（Windowsでもそのまま同じコマンドでよい）。
 
 ```bash
-python scripts/make_sample.py
-python -m animal_dash_image_poc.cli preprocess samples/sample_01.jpg -o output/sample_01.png --debug output/debug_sample_01
-python -m animal_dash_image_poc.cli run samples/sample_01.jpg -o output/sample_01
+python -m animal_dash_image_poc.cli preprocess samples/dragon.png -o output/dragon.png --debug output/debug_dragon
+python -m animal_dash_image_poc.cli run samples/dragon.png -o output/dragon
 ```
 
 ### Gemini APIキー
@@ -58,47 +83,78 @@ python -m animal_dash_image_poc.cli run samples/sample_01.jpg -o output/sample_0
 （無料枠での検証を想定 / [Google AI Studio](https://aistudio.google.com/)で発行）。
 
 ```bash
-cp .env.example .env
+cp .env.example .env       # macOS / Linux
 ```
 
-## 使い方
+```powershell
+copy .env.example .env     # Windows（PowerShell/コマンドプロンプトどちらも可）
+```
 
-### 1. 検証用サンプル画像を生成する
 
-実機で撮影した写真がまだ無くても、机の上にA4用紙を斜めに置いて撮影したような
-合成画像を生成してパイプラインを試せる。
+## テストのやり方
+
+新しく触る人向けの、動作確認の一連の流れ。
+
+### 0. 準備
+
+[セットアップ](#セットアップ)を済ませ、`.env`に`GEMINI_API_KEY`を入れておく
+（Gemini判定を試さず前処理だけ確認したい場合はキー不要）。
+
+### 1. サンプル画像を用意する
+
+`samples/` に、実際の台紙の写真 or モックアップ画像を好きなファイル名で置く
+（jpg/png どちらも可）。台紙のデザイン自体を確認したいだけなら、絵が描かれていない
+テンプレート画像でもOK（背景透過が空になるだけ）。
+
+### 2. まずOpenCV前処理だけ試す（Geminiのキーが無くてもOK・タダで何度でも試せる）
 
 ```bash
-mise run sample
-# -> samples/sample_01.jpg
+python -m animal_dash_image_poc.cli preprocess samples/<ファイル名> \
+  -o output/<名前>.png \
+  --debug output/debug_<名前>
 ```
 
-### 2. OpenCV前処理のみ実行（Gemini不要）
+確認するもの：
+
+- `output/<名前>.png` … 最終的な透過PNG。輪郭内側の色が消えていないか、
+  余計な背景が残っていないか、右向き・全身になっているかを目視確認する
+- `output/debug_<名前>/` … 各ステップの中間画像。うまくいかない時はここを見て
+  どの段階で崩れているか切り分ける
+  - `01_warped.png` … 枠検出＆台形補正の結果（ここが歪んでいたら`find_frame_corners`の問題）
+  - `02_illum_corrected.png` … 影・明るさ補正後
+  - `03_mask.png` … 背景/インクの二値マスク（白＝インクとして残す部分）
+  - `04_rgba.png` … マスクを適用した透過画像（crop前）
+  - `05_cropped.png` / `06_padded.png` … crop後 / 正方形padding後（最終出力と同じ）
+
+透過PNGはVSCodeのプレビューや`Read`ツールだと背景が黒っぽく/白っぽく表示されることが
+あるが、これは表示側の都合。alphaが本当に0になっているかはコードで確認できる
+（不安なら聞いてください）。
+
+### 3. Gemini判定も含めて一気通貫で試す
 
 ```bash
-mise run preprocess
-# -> output/sample_01.png （透過PNG）
-# -> output/debug_sample_01/ （各ステップの中間画像）
+python -m animal_dash_image_poc.cli run samples/<ファイル名> -o output/<名前>
 ```
 
-`--debug` で指定したディレクトリに、台形補正後・影補正後・マスク・透過後・crop後・
-padding後の各画像が出力されるので、しきい値調整の確認に使う。
+- `output/<名前>.png` … 透過PNG（手順2と同じ）
+- `output/<名前>.json` … `animal_type` / `features` / `personality` / `title` / `stats`
+  （speed・jump・powerの合計が30になっているか、内容が不自然でないかを確認）
 
-### 3. 前処理 + Gemini判定を一気通貫で実行
+**注意：`status`サブコマンド単体だとファイルに保存されず標準出力に表示されるだけ。**
+JSONを残したい場合は必ず`run`サブコマンドを使う。
 
-```bash
-mise run run
-# -> output/sample_01.png
-# -> output/sample_01.json （animal_type / features / personality / title / stats）
-```
+Gemini呼び出しは1件あたり10〜20秒程度かかる（サーバー混雑時はもっとかかったり
+`503 UNAVAILABLE`で失敗することもある。その場合は少し待って再実行すればよい）。
 
-個別のコマンドは以下からも実行できる。
+### 4. 結果がおかしい時にいじる場所
 
-```bash
-python -m animal_dash_image_poc.cli preprocess <input.jpg> -o <output.png> [--debug <dir>]
-python -m animal_dash_image_poc.cli status <preprocessed.png> [--api-key ...]
-python -m animal_dash_image_poc.cli run <input.jpg> -o <output_prefix> [--debug <dir>]
-```
+| 症状 | 見る/直すファイル |
+|---|---|
+| 台形補正が変な形になる・枠が検出できない | `preprocessing.py` の `find_frame_corners`（しきい値`dark_thresh`, `min_area_ratio`） |
+| 輪郭の内側の色が透過で消える | `preprocessing.py` の `build_ink_mask`（`gap_close_ratio`を上げると輪郭の隙間をより強く塞げる） |
+| 枠線の縁が透過画像に残る | `preprocessing.py` の `strip_frame_border`（`inset_ratio`） |
+| Geminiの判定内容・文面を変えたい | `prompts/character_status.md` を直接編集するだけでOK（コード変更不要） |
+| ステータスの合計値やレンジを変えたい | `gemini_status.py` の `STAT_TOTAL` とスキーマ |
 
 ## 検証したいこと / 既知の制約
 
@@ -118,7 +174,6 @@ src/animal_dash_image_poc/
   gemini_status.py   # Gemini API: 特徴・ステータスJSON生成
   pipeline.py         # 上記をつなぐオーケストレーション
   cli.py              # CLIエントリポイント
-scripts/make_sample.py # 検証用の合成サンプル画像を生成
 samples/                # 入力画像置き場（.gitignore対象、.gitkeepのみ管理）
 output/                 # 出力画像・JSON置き場（.gitignore対象、.gitkeepのみ管理）
 ```
