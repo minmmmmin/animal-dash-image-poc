@@ -1,10 +1,16 @@
-"""OpenCV-based preprocessing: paper detection -> perspective correction ->
+"""OpenCV-based preprocessing: drawing-frame detection -> perspective correction ->
 background removal -> content crop -> square padding.
 
 Design doc pipeline (see project notes):
-  撮影画像 -> 紙の領域だけ切り出す -> 明るさ・影を補正 ->
+  撮影画像 -> 台紙の枠だけ切り出す -> 明るさ・影を補正 ->
   「白に近い画素」を背景と判定 -> 背景のalphaを0にする ->
   絵の周囲だけcrop -> 透過PNG
+
+台紙デザイン（アニマルダッシュの実際の台紙）には、描画エリアを囲む太い罫線の枠が
+印刷されている。紙全体の外周（机との境目）を検出するより、この枠自体を検出する方が
+机の色・照明・影などの環境要因に左右されず安定する。タイトル文字やスタッフ向け説明、
+ニックネーム欄なども同じ濃色インクで写り込むが、それらは枠に比べて面積が大幅に小さい
+ため、「一定面積以上かつ最大の輪郭」を選ぶことで自然に無視できる。
 """
 
 from __future__ import annotations
@@ -13,8 +19,6 @@ from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
-
-A4_ASPECT = 297.0 / 210.0  # height / width
 
 
 @dataclass
@@ -29,14 +33,30 @@ class PreprocessResult:
     debug: dict = field(default_factory=dict)
 
 
-def find_paper_corners(image_bgr: np.ndarray) -> np.ndarray | None:
-    """Locate the largest 4-point quadrilateral contour, assumed to be the paper sheet."""
+def find_frame_corners(
+    image_bgr: np.ndarray,
+    dark_thresh: int = 120,
+    min_area_ratio: float = 0.15,
+) -> np.ndarray | None:
+    """Locate the printed drawing-frame border and return its 4 outer corners.
+
+    Thresholds for "dark ink" rather than running generic Canny edge detection,
+    so stray edges from desk texture/background don't compete with the frame.
+    Picks the largest dark closed contour above `min_area_ratio` of the image,
+    which is robust against smaller same-colored elements on the sheet (title
+    text, staff instructions, nickname box, etc.) since the frame is by far
+    the biggest one.
+    """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150)
-    edges = cv2.dilate(edges, np.ones((5, 5), np.uint8), iterations=1)
+    _, dark_mask = cv2.threshold(blurred, dark_thresh, 255, cv2.THRESH_BINARY_INV)
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Bridge the frame's rounded corners / dashed anti-aliasing into one closed ring.
+    kernel_size = max(int(min(image_bgr.shape[:2]) * 0.01), 3)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    closed = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
 
@@ -45,16 +65,18 @@ def find_paper_corners(image_bgr: np.ndarray) -> np.ndarray | None:
 
     for contour in contours[:5]:
         area = cv2.contourArea(contour)
-        if area < image_area * 0.2:
+        if area < image_area * min_area_ratio:
             continue
         perimeter = cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
+        # Larger epsilon than a sharp-corner rectangle needs, since the frame's
+        # rounded corners otherwise approximate to >4 vertices.
+        approx = cv2.approxPolyDP(contour, 0.04 * perimeter, True)
         if len(approx) == 4 and cv2.isContourConvex(approx):
             return approx.reshape(4, 2).astype(np.float32)
 
-    # Fallback: rotated bounding rect of the largest contour.
+    # Fallback: rotated bounding rect of the largest sufficiently-big contour.
     largest = contours[0]
-    if cv2.contourArea(largest) < image_area * 0.1:
+    if cv2.contourArea(largest) < image_area * min_area_ratio:
         return None
     rect = cv2.minAreaRect(largest)
     return cv2.boxPoints(rect).astype(np.float32)
@@ -72,15 +94,40 @@ def order_points(pts: np.ndarray) -> np.ndarray:
     return ordered
 
 
-def warp_perspective(image_bgr: np.ndarray, corners: np.ndarray, output_width: int = 1000) -> np.ndarray:
-    ordered = order_points(corners)
-    output_height = int(output_width * A4_ASPECT)
+def warp_perspective(image_bgr: np.ndarray, corners: np.ndarray) -> np.ndarray:
+    """Perspective-correct the quadrilateral in `corners` to a fronto-parallel rectangle.
+
+    Output width/height are derived from the corner distances themselves (the
+    classic four-point-transform approach) rather than assumed from a fixed
+    paper ratio, since the target is now the printed drawing frame rather than
+    the whole A4 sheet.
+    """
+    tl, tr, br, bl = order_points(corners)
+    width = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
+    height = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
+    width, height = max(width, 1), max(height, 1)
+
     dst = np.array(
-        [[0, 0], [output_width - 1, 0], [output_width - 1, output_height - 1], [0, output_height - 1]],
+        [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
         dtype=np.float32,
     )
-    matrix = cv2.getPerspectiveTransform(ordered, dst)
-    return cv2.warpPerspective(image_bgr, matrix, (output_width, output_height))
+    matrix = cv2.getPerspectiveTransform(np.array([tl, tr, br, bl], dtype=np.float32), dst)
+    return cv2.warpPerspective(image_bgr, matrix, (width, height))
+
+
+def strip_frame_border(image_bgr: np.ndarray, inset_ratio: float = 0.03) -> np.ndarray:
+    """Crop inward slightly after warping to drop the printed frame's border stroke itself.
+
+    `find_frame_corners` returns the frame's *outer* edge, so the warped image's
+    boundary pixels are the dark border line, not paper background. Left as-is,
+    `build_ink_mask` would treat that border as "ink" and it would survive
+    `crop_to_content` as an unwanted colored ring around the character.
+    """
+    h, w = image_bgr.shape[:2]
+    dy, dx = int(h * inset_ratio), int(w * inset_ratio)
+    if h - 2 * dy <= 0 or w - 2 * dx <= 0:
+        return image_bgr
+    return image_bgr[dy : h - dy, dx : w - dx]
 
 
 def correct_illumination(image_bgr: np.ndarray, blur_ksize: int = 55) -> np.ndarray:
@@ -102,18 +149,48 @@ def build_ink_mask(
     image_bgr: np.ndarray,
     brightness_thresh: int = 225,
     saturation_thresh: int = 30,
+    gap_close_ratio: float = 0.01,
 ) -> np.ndarray:
-    """Mask of "ink" pixels: anything that is NOT near-white paper background."""
+    """Mask of "ink" pixels: everything except paper background reachable from the edges.
+
+    A plain brightness/saturation threshold would also erase light-colored fills
+    *inside* the character outline (e.g. a white-bellied dinosaur, or an
+    almost-white cat drawn with a sketchy/crayon-textured outline) since they
+    look just as "background-like" as the surrounding paper. So only
+    near-white/low-saturation pixels connected (8-connectivity) to the image
+    border count as background.
+
+    Sketchy/crayon-style outlines are often drawn with tiny gaps (dashed,
+    textured strokes rather than one solid line), which would otherwise let
+    the outside background "leak" through the outline into enclosed light
+    fills and wrongly erase them too. So the non-background ("barrier") side
+    is morphologically closed first, sealing those gaps, before checking
+    border-connectivity.
+    """
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     saturation = hsv[:, :, 1]
 
-    is_background = (gray > brightness_thresh) & (saturation < saturation_thresh)
-    mask = np.where(is_background, 0, 255).astype(np.uint8)
+    is_background_candidate = (gray > brightness_thresh) & (saturation < saturation_thresh)
+    candidate_mask = np.where(is_background_candidate, 255, 0).astype(np.uint8)
 
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    barrier_mask = 255 - candidate_mask
+    gap_close_ksize = max(int(min(image_bgr.shape[:2]) * gap_close_ratio), 3)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (gap_close_ksize, gap_close_ksize))
+    barrier_sealed = cv2.morphologyEx(barrier_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    sealed_candidate = cv2.bitwise_and(candidate_mask, cv2.bitwise_not(barrier_sealed))
+
+    _, labels = cv2.connectedComponents(sealed_candidate, connectivity=8)
+    border_labels = set(labels[0, :]) | set(labels[-1, :]) | set(labels[:, 0]) | set(labels[:, -1])
+    border_labels.discard(0)  # label 0 = non-candidate (ink/barrier) pixels, not background
+
+    background = np.isin(labels, list(border_labels)).astype(np.uint8) * 255
+    mask = 255 - background
+
+    kernel_small = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_small, iterations=2)
     mask = cv2.GaussianBlur(mask, (3, 3), 0)
     return mask
 
@@ -156,8 +233,9 @@ def process_image(
     output_square_size: int = 800,
     crop_margin: int = 20,
 ) -> PreprocessResult:
-    corners = find_paper_corners(image_bgr)
+    corners = find_frame_corners(image_bgr)
     warped = warp_perspective(image_bgr, corners) if corners is not None else image_bgr.copy()
+    warped = strip_frame_border(warped) if corners is not None else warped
 
     illum_corrected = correct_illumination(warped)
     mask = build_ink_mask(illum_corrected)
